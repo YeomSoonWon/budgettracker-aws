@@ -1,0 +1,18 @@
+# CDK
+cdk.out/
+.cdk.staging/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# AWS credentials / secrets — NEVER commit
+.env
+*.pem
+aws-exports.*
+**/credentials
+**/GoogleService-Info.plist
+
+# macOS
+.DS_Store
