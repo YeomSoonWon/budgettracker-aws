@@ -84,6 +84,10 @@ original fields under `data`.
 - **API throttling** on the HTTP API; **no secrets in code** (`.gitignore` blocks
   credentials and `GoogleService-Info.plist`; config comes from env / CDK outputs).
 - **Point-in-time recovery** on DynamoDB.
+- **Cost guardrail** — a zero-spend AWS Budget (created when `-c alertEmail=…` is
+  passed) emails on ~$0.01 of actual spend or any forecast over the $1 budget, an
+  early warning against a leaked-key bill. The email is supplied at deploy time and
+  never committed.
 
 ## Deploy (staged)
 
@@ -96,7 +100,8 @@ pip install -r requirements.txt
 npx cdk bootstrap            # one-time per account/region
 
 # 1) minimal: DynamoDB + Lambda + HTTP API (open — smoke test only)
-npx cdk deploy
+#    add -c alertEmail=you@example.com to also create the zero-spend budget
+npx cdk deploy -c alertEmail=you@example.com
 
 # 2) add Cognito auth
 npx cdk deploy -c auth=true

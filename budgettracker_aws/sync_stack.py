@@ -28,6 +28,7 @@ from aws_cdk import (
     aws_cognito as cognito,
     aws_events as events,
     aws_events_targets as targets,
+    aws_budgets as budgets,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as integrations,
     aws_apigatewayv2_authorizers as authorizers,
@@ -162,6 +163,47 @@ class BudgetTrackerSyncStack(Stack):
                 targets=[targets.LambdaFunction(backup_fn)],
             )
             CfnOutput(self, "BackupBucketName", value=bucket.bucket_name)
+
+        # --- Cost guardrail: zero-spend budget -------------------------------
+        # Pass the alert email at deploy time so it is never committed to this
+        # public repo:  cdk deploy -c alertEmail=you@example.com
+        # A tiny $1 monthly budget alerts at ~$0.01 of actual spend and on any
+        # forecast to exceed it — an early warning against a leaked-key bill.
+        alert_email = self.node.try_get_context("alertEmail")
+        if alert_email:
+            subscriber = budgets.CfnBudget.SubscriberProperty(
+                subscription_type="EMAIL", address=alert_email
+            )
+            budgets.CfnBudget(
+                self,
+                "ZeroSpendBudget",
+                budget=budgets.CfnBudget.BudgetDataProperty(
+                    budget_type="COST",
+                    time_unit="MONTHLY",
+                    budget_limit=budgets.CfnBudget.SpendProperty(amount=1, unit="USD"),
+                ),
+                notifications_with_subscribers=[
+                    budgets.CfnBudget.NotificationWithSubscribersProperty(
+                        notification=budgets.CfnBudget.NotificationProperty(
+                            notification_type="ACTUAL",
+                            comparison_operator="GREATER_THAN",
+                            threshold=1,            # 1% of $1 ≈ $0.01 → effectively "any spend"
+                            threshold_type="PERCENTAGE",
+                        ),
+                        subscribers=[subscriber],
+                    ),
+                    budgets.CfnBudget.NotificationWithSubscribersProperty(
+                        notification=budgets.CfnBudget.NotificationProperty(
+                            notification_type="FORECASTED",
+                            comparison_operator="GREATER_THAN",
+                            threshold=100,          # forecast to exceed the $1 budget
+                            threshold_type="PERCENTAGE",
+                        ),
+                        subscribers=[subscriber],
+                    ),
+                ],
+            )
+            CfnOutput(self, "BudgetAlertEmail", value=alert_email)
 
         # --- Outputs ---------------------------------------------------------
         CfnOutput(self, "ApiEndpoint", value=http_api.api_endpoint)
