@@ -88,6 +88,11 @@ original fields under `data`.
   passed) emails on ~$0.01 of actual spend or any forecast over the $1 budget, an
   early warning against a leaked-key bill. The email is supplied at deploy time and
   never committed.
+- **Automatic lockout** — alerts only notify, so a Budget Action (`APPLY_IAM_POLICY`,
+  automatic approval) attaches a deny-all policy to the `guardUser` IAM user once actual
+  monthly cost passes `guardLimitUsd`. A stolen access key for that user stops working.
+  The Budgets execution role can only attach/detach *that* policy on *that* user.
+  Recover by signing in as root and resetting the action in the Budgets console.
 
 ## Deploy (staged)
 
@@ -100,8 +105,9 @@ pip install -r requirements.txt
 npx cdk bootstrap            # one-time per account/region
 
 # 1) minimal: DynamoDB + Lambda + HTTP API (open — smoke test only)
-#    add -c alertEmail=you@example.com to also create the zero-spend budget
-npx cdk deploy -c alertEmail=you@example.com
+#    -c alertEmail  -> zero-spend budget e-mail alerts
+#    -c guardUser   -> auto-lockout of that IAM user when spend passes guardLimitUsd (default 5)
+npx cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=5
 
 # 2) add Cognito auth
 npx cdk deploy -c auth=true
@@ -125,6 +131,12 @@ API, a few KB in S3). Tear everything down with:
 ```bash
 npx cdk destroy
 ```
+
+Notes:
+- The KMS customer-managed key costs about **$1/month**, so the zero-spend alert will
+  fire shortly after deploy — expected. Keep `guardLimitUsd` above that (default 5).
+- If the lockout has fired, reset the Budget Action (root, Budgets console) before
+  `cdk destroy`; the attached deny policy blocks both the user and the policy deletion.
 
 ## Résumé line
 

@@ -29,6 +29,7 @@ from aws_cdk import (
     aws_events as events,
     aws_events_targets as targets,
     aws_budgets as budgets,
+    aws_iam as iam,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as integrations,
     aws_apigatewayv2_authorizers as authorizers,
@@ -204,6 +205,77 @@ class BudgetTrackerSyncStack(Stack):
                 ],
             )
             CfnOutput(self, "BudgetAlertEmail", value=alert_email)
+
+        # --- Cost guardrail: automatic lockout (Budget Action) ---------------
+        # Alerts only notify; this actually stops spend. When actual monthly cost
+        # passes guardLimitUsd, AWS Budgets attaches a deny-all policy to the IAM
+        # user given by guardUser (the user whose access keys could leak), so a
+        # stolen key can no longer launch resources. Recover by signing in as root
+        # and resetting the action in the Budgets console.
+        #   cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=5
+        guard_user = self.node.try_get_context("guardUser")
+        if alert_email and guard_user:
+            guard_limit = float(self.node.try_get_context("guardLimitUsd") or 5)
+            guard_budget_name = f"{self.stack_name}-guard"
+
+            budgets.CfnBudget(
+                self,
+                "GuardBudget",
+                budget=budgets.CfnBudget.BudgetDataProperty(
+                    budget_name=guard_budget_name,
+                    budget_type="COST",
+                    time_unit="MONTHLY",
+                    budget_limit=budgets.CfnBudget.SpendProperty(amount=guard_limit, unit="USD"),
+                ),
+            )
+
+            deny_all = iam.ManagedPolicy(
+                self,
+                "EmergencyDenyAll",
+                description="Attached by AWS Budgets when spend exceeds the guard limit",
+                statements=[iam.PolicyStatement(
+                    effect=iam.Effect.DENY, actions=["*"], resources=["*"]
+                )],
+            )
+
+            user_arn = self.format_arn(
+                service="iam", region="", resource="user", resource_name=guard_user
+            )
+            exec_role = iam.Role(
+                self,
+                "BudgetActionRole",
+                assumed_by=iam.ServicePrincipal("budgets.amazonaws.com"),
+                description="Lets AWS Budgets attach/detach only the deny policy on one user",
+            )
+            # Least privilege: only this user, only this policy.
+            exec_role.add_to_policy(iam.PolicyStatement(
+                actions=["iam:AttachUserPolicy", "iam:DetachUserPolicy"],
+                resources=[user_arn],
+                conditions={"ArnEquals": {"iam:PolicyARN": deny_all.managed_policy_arn}},
+            ))
+
+            action = budgets.CfnBudgetsAction(
+                self,
+                "GuardLockout",
+                budget_name=guard_budget_name,
+                notification_type="ACTUAL",
+                action_type="APPLY_IAM_POLICY",
+                action_threshold=budgets.CfnBudgetsAction.ActionThresholdProperty(
+                    type="PERCENTAGE", value=100
+                ),
+                definition=budgets.CfnBudgetsAction.DefinitionProperty(
+                    iam_action_definition=budgets.CfnBudgetsAction.IamActionDefinitionProperty(
+                        policy_arn=deny_all.managed_policy_arn, users=[guard_user]
+                    )
+                ),
+                execution_role_arn=exec_role.role_arn,
+                approval_model="AUTOMATIC",
+                subscribers=[budgets.CfnBudgetsAction.SubscriberProperty(
+                    type="EMAIL", address=alert_email
+                )],
+            )
+            action.node.add_dependency(self.node.find_child("GuardBudget"))
+            CfnOutput(self, "GuardLimitUsd", value=str(guard_limit))
 
         # --- Outputs ---------------------------------------------------------
         CfnOutput(self, "ApiEndpoint", value=http_api.api_endpoint)
