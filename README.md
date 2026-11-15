@@ -34,13 +34,13 @@ as Code**.
           └──────────────┬──────────────┘
                          ▼
           ┌─────────────────────────────┐      ┌──────────────────────┐
-          │  Amazon DynamoDB             │      │  AWS KMS (CMK)        │
-          │  single table  PK / SK       │◀────▶│  encryption at rest   │
-          └──────────────┬──────────────┘      └──────────────────────┘
+          │  Amazon DynamoDB             │  provisioned 1 RCU / 1 WCU,
+          │  single table  PK / SK       │  AWS-owned key encryption
+          └──────────────┬──────────────┘
                          │ monthly (EventBridge)
                          ▼
           ┌─────────────────────────────┐
-          │  Amazon S3 (KMS)  backups    │  JSON snapshot per household/month
+          │  Amazon S3 (SSE-S3) backups  │  JSON snapshot per household/month
           └─────────────────────────────┘
 ```
 
@@ -80,10 +80,11 @@ original fields under `data`.
   no-auth shared Firestore document). Strong password policy, 1-hour tokens.
 - **IAM least privilege** — each Lambda is granted only the specific table/bucket
   actions it needs (CDK `grant_*`), never a wildcard.
-- **KMS customer-managed key** encrypts DynamoDB and S3 at rest, with key rotation.
-- **API throttling** on the HTTP API; **no secrets in code** (`.gitignore` blocks
+- **Encryption at rest** with AWS-owned keys (DynamoDB) and SSE-S3 (S3), plus
+  TLS-only access to the backup bucket. A KMS customer-managed key was dropped on
+  purpose: it costs about $1/month and the project runs at $0.
+- **API throttling** (5 req/s, burst 10) on the HTTP API; **no secrets in code** (`.gitignore` blocks
   credentials and `GoogleService-Info.plist`; config comes from env / CDK outputs).
-- **Point-in-time recovery** on DynamoDB.
 - **Cost guardrail** — a zero-spend AWS Budget (created when `-c alertEmail=…` is
   passed) emails on ~$0.01 of actual spend or any forecast over the $1 budget, an
   early warning against a leaked-key bill. The email is supplied at deploy time and
@@ -106,8 +107,8 @@ npx cdk bootstrap            # one-time per account/region
 
 # 1) minimal: DynamoDB + Lambda + HTTP API (open — smoke test only)
 #    -c alertEmail  -> zero-spend budget e-mail alerts
-#    -c guardUser   -> auto-lockout of that IAM user when spend passes guardLimitUsd (default 5)
-npx cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=5
+#    -c guardUser   -> auto-lockout of that IAM user when spend passes guardLimitUsd (default 1)
+npx cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=1
 
 # 2) add Cognito auth
 npx cdk deploy -c auth=true
@@ -125,16 +126,28 @@ python3 scripts/seed_dummy.py <ApiEndpoint> --token <idToken>   # with auth
 
 ## Cost & cleanup
 
-Designed to sit inside the AWS Free Tier (on-demand DynamoDB, 128 MB Lambda, HTTP
-API, a few KB in S3). Tear everything down with:
+Target cost is **$0**. Each choice that would otherwise bill was changed:
+
+| Item | Choice | Why |
+|---|---|---|
+| Encryption | AWS-owned key / SSE-S3 | a KMS customer-managed key costs ~$1/month |
+| DynamoDB | provisioned 1 RCU / 1 WCU | always-free covers 25 provisioned units; on-demand requests are billed |
+| DynamoDB PITR | off | billed per GB-month |
+| S3 backup | off by default, no versioning | storage would accumulate |
+| Lambda logs | 1-week retention, deleted on destroy | avoid growing log storage |
+| API | throttled 5 req/s | caps request volume if the URL leaks |
+| Budgets | 2 budgets, 1 with an action | the first two action-enabled budgets are free |
+
+Tear everything down with:
 
 ```bash
 npx cdk destroy
 ```
 
 Notes:
-- The KMS customer-managed key costs about **$1/month**, so the zero-spend alert will
-  fire shortly after deploy — expected. Keep `guardLimitUsd` above that (default 5).
+- `cdk bootstrap` creates a separate `CDKToolkit` stack with a small S3 staging bucket.
+  For a full cleanup, empty that bucket and delete the `CDKToolkit` stack in the
+  CloudFormation console.
 - If the lockout has fired, reset the Budget Action (root, Budgets console) before
   `cdk destroy`; the attached deny policy blocks both the user and the policy deletion.
 
@@ -142,4 +155,5 @@ Notes:
 
 > Built a hybrid local-first sync backend for a personal macOS finance app (SwiftUI),
 > replacing Firebase with a self-managed AWS stack (API Gateway, Lambda/Python,
-> DynamoDB, Cognito, KMS, S3), defined entirely as code with AWS CDK.
+> DynamoDB, Cognito, S3), defined entirely as code with AWS CDK and designed to run at
+> $0 with budget alerts and an automatic IAM lockout.

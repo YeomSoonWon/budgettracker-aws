@@ -6,10 +6,12 @@ layer is added deliberately (good for explaining the design in an interview):
 
     cdk deploy                       # DynamoDB + Lambda + HTTP API  (open, smoke test)
     cdk deploy -c auth=true          # + Cognito User Pool & JWT authorizer
-    cdk deploy -c auth=true -c backup=true   # + S3 monthly backup (KMS encrypted)
+    cdk deploy -c auth=true -c backup=true   # + S3 monthly backup
 
 Security choices baked in:
-  * KMS customer-managed key encrypts DynamoDB and S3 at rest.
+  * Zero-cost by design: AWS-owned / S3-managed encryption at rest (no KMS key
+    fee), DynamoDB provisioned at 1 RCU/1 WCU (inside the always-free 25), no PITR,
+    1-week log retention, and API throttling to cap request volume.
   * IAM is least-privilege via CDK grants (each Lambda gets only the table/bucket
     actions it needs — never a wildcard).
   * API Gateway has throttling; Cognito JWT authorizer gates every route when enabled.
@@ -22,7 +24,7 @@ from aws_cdk import (
     RemovalPolicy,
     CfnOutput,
     aws_dynamodb as dynamodb,
-    aws_kms as kms,
+    aws_logs as logs,
     aws_lambda as lambda_,
     aws_s3 as s3,
     aws_cognito as cognito,
@@ -44,15 +46,6 @@ class BudgetTrackerSyncStack(Stack):
         enable_auth = self.node.try_get_context("auth") == "true"
         enable_backup = self.node.try_get_context("backup") == "true"
 
-        # --- KMS: one customer-managed key for all data at rest ---------------
-        key = kms.Key(
-            self,
-            "DataKey",
-            description="BudgetTracker data-at-rest CMK (DynamoDB + S3)",
-            enable_key_rotation=True,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
         # --- DynamoDB: single-table design -----------------------------------
         # PK = HOUSEHOLD#<id>, SK = TXN#/FIXED#/SALARY#/SETTINGS#...
         table = dynamodb.Table(
@@ -64,12 +57,14 @@ class BudgetTrackerSyncStack(Stack):
             sort_key=dynamodb.Attribute(
                 name="SK", type=dynamodb.AttributeType.STRING
             ),
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
-            encryption_key=key,
-            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
-                point_in_time_recovery_enabled=True
-            ),
+            # Provisioned 1/1 stays inside the always-free 25 RCU / 25 WCU;
+            # on-demand requests are not covered by the free tier.
+            billing_mode=dynamodb.BillingMode.PROVISIONED,
+            read_capacity=1,
+            write_capacity=1,
+            # AWS-owned key: encrypted at rest with no KMS charge.
+            encryption=dynamodb.TableEncryption.DEFAULT,
+            # PITR is billed per GB-month, so it stays off for this demo.
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -83,6 +78,11 @@ class BudgetTrackerSyncStack(Stack):
             timeout=Duration.seconds(10),
             memory_size=128,
             environment={"TABLE_NAME": table.table_name},
+            log_group=logs.LogGroup(
+                self, "SyncFnLogs",
+                retention=logs.RetentionDays.ONE_WEEK,
+                removal_policy=RemovalPolicy.DESTROY,
+            ),
         )
         table.grant_read_write_data(sync_fn)  # least-privilege: this table only
 
@@ -93,12 +93,18 @@ class BudgetTrackerSyncStack(Stack):
             api_name="budgettracker-sync",
             description="Delta-sync API for the BudgetTracker macOS app",
         )
+        # Throttle every route so an exposed endpoint cannot be flooded.
+        default_stage = http_api.default_stage.node.default_child
+        default_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
+            throttling_rate_limit=5, throttling_burst_limit=10
+        )
 
         route_auth = None
         if enable_auth:
             user_pool = cognito.UserPool(
                 self,
                 "UserPool",
+                feature_plan=cognito.FeaturePlan.LITE,  # free-tier plan, no advanced security
                 self_sign_up_enabled=False,  # household members invited by admin
                 sign_in_aliases=cognito.SignInAliases(email=True),
                 password_policy=cognito.PasswordPolicy(
@@ -135,10 +141,10 @@ class BudgetTrackerSyncStack(Stack):
             bucket = s3.Bucket(
                 self,
                 "BackupBucket",
-                encryption=s3.BucketEncryption.KMS,
-                encryption_key=key,
+                encryption=s3.BucketEncryption.S3_MANAGED,  # SSE-S3, no KMS charge
                 block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-                versioned=True,
+                enforce_ssl=True,
+                versioned=False,  # versions would keep accumulating storage
                 removal_policy=RemovalPolicy.DESTROY,
                 auto_delete_objects=True,
             )
@@ -150,6 +156,11 @@ class BudgetTrackerSyncStack(Stack):
                 code=lambda_.Code.from_asset("lambda/backup"),
                 timeout=Duration.seconds(60),
                 memory_size=256,
+                log_group=logs.LogGroup(
+                    self, "BackupFnLogs",
+                    retention=logs.RetentionDays.ONE_WEEK,
+                    removal_policy=RemovalPolicy.DESTROY,
+                ),
                 environment={
                     "TABLE_NAME": table.table_name,
                     "BACKUP_BUCKET": bucket.bucket_name,
@@ -212,10 +223,10 @@ class BudgetTrackerSyncStack(Stack):
         # user given by guardUser (the user whose access keys could leak), so a
         # stolen key can no longer launch resources. Recover by signing in as root
         # and resetting the action in the Budgets console.
-        #   cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=5
+        #   cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=1
         guard_user = self.node.try_get_context("guardUser")
         if alert_email and guard_user:
-            guard_limit = float(self.node.try_get_context("guardLimitUsd") or 5)
+            guard_limit = float(self.node.try_get_context("guardLimitUsd") or 1)
             guard_budget_name = f"{self.stack_name}-guard"
 
             budgets.CfnBudget(
