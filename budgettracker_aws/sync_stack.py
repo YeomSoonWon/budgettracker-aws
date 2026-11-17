@@ -118,6 +118,11 @@ class BudgetTrackerSyncStack(Stack):
             user_pool_client = user_pool.add_client(
                 "AppClient",
                 auth_flows=cognito.AuthFlow(user_srp=True, user_password=True),
+                # householdId decides whose data a token can reach, so only an
+                # admin may set it; users cannot rewrite it via UpdateUserAttributes.
+                write_attributes=cognito.ClientAttributes().with_standard_attributes(
+                    email=True
+                ),
                 id_token_validity=Duration.hours(1),
                 access_token_validity=Duration.hours(1),
                 refresh_token_validity=Duration.days(30),

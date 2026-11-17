@@ -78,6 +78,15 @@ original fields under `data`.
 
 - **Cognito** User Pool + JWT authorizer gates every API route (replacing the old
   no-auth shared Firestore document). Strong password policy, 1-hour tokens.
+  Self sign-up is off; household members are created by an admin.
+- **Tenant isolation** — the Lambda scopes every read/write to the
+  `custom:householdId` claim of the caller's ID token. The app client may only
+  write `email`, so a signed-in user cannot call `UpdateUserAttributes` to point
+  their token at another household; only an admin can set `householdId`.
+- **App-side sign-in** — the macOS app calls Cognito `InitiateAuth` directly (no
+  SDK). It keeps only the refresh token in the Keychain (this device only), holds
+  the 1-hour ID token in memory and renews it before expiry, and never stores the
+  password.
 - **IAM least privilege** — each Lambda is granted only the specific table/bucket
   actions it needs (CDK `grant_*`), never a wildcard.
 - **Encryption at rest** with AWS-owned keys (DynamoDB) and SSE-S3 (S3), plus
@@ -100,6 +109,12 @@ original fields under `data`.
 Prerequisites: an AWS account + configured CLI credentials, Node (for the CDK CLI),
 Python 3.12.
 
+The stack is region-agnostic and deploys to the CLI's default region. Accounts
+created through the new AWS sign-up "projects" flow are locked to one Region chosen
+from the contact-address country (`us-east-2`, `eu-north-1` or `ap-southeast-2`;
+Korea maps to Sydney), so set the CLI region to the project's Region — see
+[Troubleshooting](#troubleshooting).
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -110,11 +125,14 @@ npx cdk bootstrap            # one-time per account/region
 #    -c guardUser   -> auto-lockout of that IAM user when spend passes guardLimitUsd (default 1)
 npx cdk deploy -c alertEmail=you@example.com -c guardUser=my-iam-user -c guardLimitUsd=1
 
+# Context flags are per-deploy: repeat the ones you want to keep, or that
+# resource is removed on the next deploy.
+
 # 2) add Cognito auth
-npx cdk deploy -c auth=true
+npx cdk deploy -c auth=true -c alertEmail=… -c guardUser=…
 
 # 3) add S3 monthly backup
-npx cdk deploy -c auth=true -c backup=true
+npx cdk deploy -c auth=true -c backup=true -c alertEmail=… -c guardUser=…
 ```
 
 Seed and verify with dummy data (prints the push result and pulls it back):
@@ -123,6 +141,51 @@ Seed and verify with dummy data (prints the push result and pulls it back):
 python3 scripts/seed_dummy.py <ApiEndpoint>          # open mode
 python3 scripts/seed_dummy.py <ApiEndpoint> --token <idToken>   # with auth
 ```
+
+With auth on, create a household member as admin (no invitation e-mail), then let
+the member set their own password:
+
+```bash
+aws cognito-idp admin-create-user --user-pool-id <UserPoolId> --username <email> \
+  --user-attributes Name=email,Value=<email> Name=email_verified,Value=true \
+                    Name=custom:householdId,Value=main --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id <UserPoolId> \
+  --username <email> --password '<chosen by the member>' --permanent
+```
+
+In the app: Settings → AWS 동기화 → enter `ApiEndpoint`, `UserPoolClientId`, then
+sign in.
+
+## Verified deployment
+
+Deployed on 2026-11-18 to `ap-southeast-2`, then torn down to keep the account at $0.
+
+| Check | Result |
+|---|---|
+| `cdk bootstrap` + `cdk deploy` (stage 1 + budgets) | ✅ stack created in ~60 s |
+| `POST /sync` with 5 dummy items | ✅ 5 × `applied` (settings, salary, fixed expense, 2 transactions) |
+| `GET /sync?since=0` | ✅ 5 items pulled back |
+| Zero-spend budget + guard budget | ✅ both created, $1 limit |
+| Budget Action (auto-lockout) | ✅ registered, `STANDBY`, `AUTOMATIC` approval |
+| Teardown | ✅ app stack, `CDKToolkit` and its retained bucket deleted; 0 billable resources left |
+
+Stage 2 (`-c auth=true`) synthesizes cleanly; `cdk diff` against the live stack
+showed only the User Pool, app client and JWT authorizer added, and the two
+`/sync` routes switched to the authorizer.
+
+## Troubleshooting
+
+**`explicit deny in a service control policy` for CloudFormation, DynamoDB, Lambda…**
+A new account from the "projects" sign-up flow is a member of an AWS-managed
+organization whose SCP denies every Region except the project's. IAM and Budgets
+(global) still work, which makes it look like a permissions problem. The error
+names the SCP ARN in the managing organization; `aws login` then reported the
+project's Region. Fix: `aws configure set region <project-region>`. The Region
+is shown at settings.aws.com → Project → Overview.
+
+**`CERTIFICATE_VERIFY_FAILED` from `seed_dummy.py`** — the python.org build of
+Python ships without a CA bundle. Run *Install Certificates.command* once, or
+`SSL_CERT_FILE=/etc/ssl/cert.pem python3 scripts/seed_dummy.py …`.
 
 ## Cost & cleanup
 
@@ -146,8 +209,11 @@ npx cdk destroy
 
 Notes:
 - `cdk bootstrap` creates a separate `CDKToolkit` stack with a small S3 staging bucket.
-  For a full cleanup, empty that bucket and delete the `CDKToolkit` stack in the
-  CloudFormation console.
+  For a full cleanup, delete the `CDKToolkit` stack, then delete the staging bucket:
+  it is retained on stack deletion and versioned, so remove every object *version*
+  (not just the objects) before `delete-bucket`.
+- Deactivate the deploy user's access key while nothing is deployed; the budget
+  guardrails are part of the stack and disappear with it.
 - If the lockout has fired, reset the Budget Action (root, Budgets console) before
   `cdk destroy`; the attached deny policy blocks both the user and the policy deletion.
 
@@ -155,5 +221,6 @@ Notes:
 
 > Built a hybrid local-first sync backend for a personal macOS finance app (SwiftUI),
 > replacing Firebase with a self-managed AWS stack (API Gateway, Lambda/Python,
-> DynamoDB, Cognito, S3), defined entirely as code with AWS CDK and designed to run at
-> $0 with budget alerts and an automatic IAM lockout.
+> DynamoDB, Cognito, S3), defined entirely as code with AWS CDK. Added Cognito
+> sign-in with per-household tenant isolation, and designed it to run at $0 with
+> budget alerts and an automatic IAM lockout.
